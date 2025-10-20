@@ -1,153 +1,74 @@
 <#
 .SYNOPSIS
-  Azure Service Health Report (Management Group Level) with Managed Identity and Microsoft Graph Email
+  Azure Tenant-Level Service Health Report via Microsoft Graph
 .DESCRIPTION
-  Retrieves Azure Service Health issues, advisories, and maintenance events
-  across all subscriptions under a management group and emails an HTML report via Microsoft Graph.
+  Fetches tenant-wide Azure Service Health (Service Issues, Planned Maintenance, Health & Security Advisories) using Microsoft Graph
+  and sends an HTML report via Microsoft Graph email using a system-assigned managed identity.
 #>
 
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
-$ManagementGroupId = "YourMgmtGroupIdHere"
-$OutputHtmlFile = "C:\Temp\ServiceHealthReport.html"
-
-# Email details
+$OutputHtmlFile = "C:\Temp\TenantServiceHealthReport.html"
 $To = "you@example.com"
-$Subject = "Azure Service Health Report - $(Get-Date -Format 'dd-MMM-yyyy')"
-
-# Microsoft Graph Client ID for Managed Identity
+$Subject = "Azure Tenant Service Health Report - $(Get-Date -Format 'dd-MMM-yyyy')"
 $ManagedIdentityClientId = "9464e54c-6ec0-4b15-8380-6172a2e3114b"
 
 # ----------------------------
-# CONNECT TO MICROSOFT GRAPH USING SYSTEM-ASSIGNED MANAGED IDENTITY
+# CONNECT TO MICROSOFT GRAPH
 # ----------------------------
 Write-Host "🔹 Connecting to Microsoft Graph with Managed Identity..."
-Connect-MgGraph -Identity -ClientId $ManagedIdentityClientId -ErrorAction SilentlyContinue
+Connect-MgGraph -Identity -ClientId $ManagedIdentityClientId -ErrorAction Stop
 Write-Host "✅ Connected to Microsoft Graph."
 
 # ----------------------------
-# GET SUBSCRIPTIONS UNDER MGMT GROUP
+# GET SERVICE HEALTH MESSAGES
 # ----------------------------
-Write-Host "🔹 Getting subscriptions under management group: $ManagementGroupId"
-$subs = Get-AzManagementGroupSubscription -GroupId $ManagementGroupId -ErrorAction Stop
-if (-not $subs) {
-    Write-Host "⚠️ No subscriptions found under management group $ManagementGroupId."
-    exit
-}
+Write-Host "🔹 Fetching tenant-level service health messages..."
+$messages = Get-MgAdminServiceAnnouncementMessage -Status Active,Resolved -ErrorAction Stop
 
-# ----------------------------
-# COLLECT SERVICE HEALTH EVENTS
-# ----------------------------
-$allEvents = @()
-
-foreach ($sub in $subs) {
-    $subId = $sub.Id -replace ".*/"
-    Set-AzContext -SubscriptionId $subId -ErrorAction SilentlyContinue | Out-Null
-    Write-Host "🔸 Checking subscription: $subId"
-
-    try {
-        $events = Get-AzServiceHealthEvent -Status Active, Resolved -ErrorAction Stop
-        foreach ($event in $events) {
-            $regions = if ($event.AffectedRegion.Name) { ($event.AffectedRegion.Name -join ', ') } else { 'Global' }
-            $impact = if ($event.ImpactType) { $event.ImpactType } else { 'N/A' }
-
-            $allEvents += [PSCustomObject]@{
-                SubscriptionId   = $subId
-                SubscriptionName = (Get-AzSubscription -SubscriptionId $subId).Name
-                Title            = $event.Title
-                Impact           = $impact
-                Status           = $event.Status
-                IncidentType     = $event.IncidentType
-                StartTime        = $event.StartTime
-                LastUpdateTime   = $event.LastUpdateTime
-                Regions          = $regions
-            }
-        }
-    } catch {
-        Write-Host "⚠️ Skipping subscription $subId due to permission or access issues."
-    }
-}
-
-# ----------------------------
-# BUILD ENHANCED HTML REPORT
-# ----------------------------
-if (-not $allEvents) {
-    Write-Host "✅ No events found."
+if (-not $messages) {
+    Write-Host "✅ No active or recent service health messages found."
     $htmlBody = @"
     <div style='text-align:center; font-family:Segoe UI;'>
         <h2 style='color:#107C10;'>✅ All Systems Healthy</h2>
-        <p style='font-size:14px;'>No active or recent Azure Service Health events found under management group 
-        <b>$ManagementGroupId</b>.</p>
+        <p style='font-size:14px;'>No active or recent Azure Service Health messages found for this tenant.</p>
     </div>
 "@
 } else {
-    Write-Host "📊 Building enhanced HTML report for $($allEvents.Count) event(s)..."
+    Write-Host "📊 Building HTML report for $($messages.Count) messages..."
 
-    $summary = $allEvents | Group-Object -Property IncidentType | ForEach-Object {
-        [PSCustomObject]@{
-            Type  = $_.Name
-            Count = $_.Count
-        }
-    }
-
-    $typeMap = @{
-        "ServiceIssue"        = "Service Issues"
-        "PlannedMaintenance"  = "Planned Maintenance"
-        "HealthAdvisory"      = "Health Advisories"
-        "SecurityAdvisory"    = "Security Advisories"
-    }
+    # Categorize messages
+    $grouped = $messages | Group-Object -Property Service
 
     $htmlBody = @"
-    <h2 style='color:#0078D4; font-family:Segoe UI;'>Azure Service Health Summary</h2>
-    <p style='font-family:Segoe UI; font-size:13px;'>
-        <b>Management Group:</b> $ManagementGroupId <br/>
-        <b>Generated:</b> $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss') <br/>
-        <b>Total Events:</b> $($allEvents.Count)
-    </p>
+    <h2 style='color:#0078D4; font-family:Segoe UI;'>Azure Tenant Service Health Summary</h2>
+    <p style='font-family:Segoe UI; font-size:13px;'>Generated: $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')<br/>Total Messages: $($messages.Count)</p>
 "@
 
-    $htmlBody += "<div style='display:flex; gap:15px; flex-wrap:wrap; margin-bottom:20px;'>"
-    foreach ($s in $summary) {
-        $label = $typeMap[$s.Type]
-        $color = switch ($s.Type) {
-            "ServiceIssue"        { "#E81123" }
-            "PlannedMaintenance"  { "#0078D4" }
-            "HealthAdvisory"      { "#107C10" }
-            "SecurityAdvisory"    { "#FFB900" }
-            default               { "#666" }
-        }
-
-        $htmlBody += "<div style='flex:1; min-width:150px; background:$color; color:white; border-radius:10px; padding:12px; text-align:center;'>"
-        $htmlBody += "<div style='font-size:22px; font-weight:bold;'>$($s.Count)</div>"
-        $htmlBody += "<div style='font-size:13px;'>$label</div></div>"
-    }
-    $htmlBody += "</div>"
-
-    $grouped = $allEvents | Group-Object -Property IncidentType
     foreach ($group in $grouped) {
-        $incidentType = $typeMap[$group.Name]
-        $color = switch ($group.Name) {
-            "ServiceIssue"        { "#FDE7E9" }
-            "PlannedMaintenance"  { "#E7F3FD" }
-            "HealthAdvisory"      { "#E6F4EA" }
-            "SecurityAdvisory"    { "#FFF4CE" }
-            default               { "#f9f9f9" }
-        }
-
-        $htmlBody += "<h3 style='color:#333;font-family:Segoe UI;margin-top:25px;'>$incidentType</h3>"
+        $serviceName = $group.Name
+        $htmlBody += "<h3 style='color:#333;font-family:Segoe UI;margin-top:20px;'>$serviceName</h3>"
         $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>"
-        $htmlBody += "<thead><tr style='background-color:$color; border-bottom:2px solid #ccc;'>"
-        $htmlBody += "<th style='padding:8px; text-align:left;'>Subscription</th><th style='padding:8px; text-align:left;'>Title</th><th style='padding:8px; text-align:left;'>Impact</th><th style='padding:8px; text-align:left;'>Status</th><th style='padding:8px; text-align:left;'>Start Time</th><th style='padding:8px; text-align:left;'>Last Update</th><th style='padding:8px; text-align:left;'>Region(s)</th></tr></thead><tbody>"
+        $htmlBody += "<thead><tr style='background-color:#E7F3FD; border-bottom:2px solid #ccc;'>"
+        $htmlBody += "<th style='padding:8px; text-align:left;'>Title</th><th style='padding:8px; text-align:left;'>Status</th><th style='padding:8px; text-align:left;'>Start Date</th><th style='padding:8px; text-align:left;'>Last Updated</th><th style='padding:8px; text-align:left;'>Details</th></tr></thead><tbody>"
 
-        foreach ($e in $group.Group) {
-            $statusColor = if ($e.Status -eq "Active") { "color:#E81123;font-weight:bold;" } else { "color:#107C10;" }
-            $htmlBody += "<tr style='border-bottom:1px solid #eee;'><td style='padding:6px;'>$($e.SubscriptionName)</td><td style='padding:6px;'>$($e.Title)</td><td style='padding:6px;'>$($e.Impact)</td><td style='padding:6px;$statusColor'>$($e.Status)</td><td style='padding:6px;'>$($e.StartTime.ToString('dd-MMM-yyyy HH:mm'))</td><td style='padding:6px;'>$($e.LastUpdateTime.ToString('dd-MMM-yyyy HH:mm'))</td><td style='padding:6px;'>$($e.Regions)</td></tr>"
+        foreach ($msg in $group.Group) {
+            $statusColor = if ($msg.Status -eq 'Active') { 'color:#E81123;font-weight:bold;' } else { 'color:#107C10;' }
+            $htmlBody += "<tr style='border-bottom:1px solid #eee;'>"
+            $htmlBody += "<td style='padding:6px;'>$($msg.Title)</td>"
+            $htmlBody += "<td style='padding:6px;$statusColor'>$($msg.Status)</td>"
+            $htmlBody += "<td style='padding:6px;'>$($msg.StartDateTime.ToLocalTime().ToString('dd-MMM-yyyy HH:mm'))</td>"
+            $htmlBody += "<td style='padding:6px;'>$($msg.LastModifiedDateTime.ToLocalTime().ToString('dd-MMM-yyyy HH:mm'))</td>"
+            $htmlBody += "<td style='padding:6px;'><a href='$($msg.MicrosoftGraphUrl)' target='_blank'>Details</a></td>"
+            $htmlBody += "</tr>"
         }
+
         $htmlBody += "</tbody></table><br/>"
     }
 }
 
+# Final HTML layout
 $emailBody = @"
 <html>
 <head>
@@ -165,7 +86,7 @@ $htmlBody
 </html>
 "@
 
-# Save report locally
+# Save HTML report locally
 $emailBody | Out-File -FilePath $OutputHtmlFile -Encoding UTF8
 Write-Host "✅ HTML report saved to: $OutputHtmlFile"
 
@@ -177,7 +98,7 @@ try {
         Message = @{
             Subject = $Subject
             Body    = @{
-                ContentType = "HTML"
+                ContentType = 'HTML'
                 Content     = $emailBody
             }
             ToRecipients = @(@{EmailAddress=@{Address=$To}})
