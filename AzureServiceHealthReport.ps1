@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-  Azure Service Health Report (Management Group Level)
+  Azure Service Health Report (Management Group Level) with Managed Identity and Microsoft Graph Email
 .DESCRIPTION
   Retrieves Azure Service Health issues, advisories, and maintenance events
-  across all subscriptions under a management group and emails an HTML report.
+  across all subscriptions under a management group and emails an HTML report via Microsoft Graph.
 #>
 
 # ----------------------------
@@ -12,18 +12,19 @@
 $ManagementGroupId = "YourMgmtGroupIdHere"
 $OutputHtmlFile = "C:\Temp\ServiceHealthReport.html"
 
-# Email details (optional - if you want to send mail)
+# Email details
 $To = "you@example.com"
-$From = "azurehealth@example.com"
-$SmtpServer = "smtp.office365.com"
 $Subject = "Azure Service Health Report - $(Get-Date -Format 'dd-MMM-yyyy')"
 
+# Microsoft Graph Client ID for Managed Identity
+$ManagedIdentityClientId = "9464e54c-6ec0-4b15-8380-6172a2e3114b"
+
 # ----------------------------
-# CONNECT TO AZURE
+# CONNECT TO MICROSOFT GRAPH USING SYSTEM-ASSIGNED MANAGED IDENTITY
 # ----------------------------
-Write-Host "🔹 Connecting to Azure..."
-Connect-AzAccount -WarningAction SilentlyContinue | Out-Null
-Write-Host "✅ Connected to Azure."
+Write-Host "🔹 Connecting to Microsoft Graph with Managed Identity..."
+Connect-MgGraph -Identity -ClientId $ManagedIdentityClientId -ErrorAction SilentlyContinue
+Write-Host "✅ Connected to Microsoft Graph."
 
 # ----------------------------
 # GET SUBSCRIPTIONS UNDER MGMT GROUP
@@ -83,7 +84,6 @@ if (-not $allEvents) {
 } else {
     Write-Host "📊 Building enhanced HTML report for $($allEvents.Count) event(s)..."
 
-    # Create summary counts
     $summary = $allEvents | Group-Object -Property IncidentType | ForEach-Object {
         [PSCustomObject]@{
             Type  = $_.Name
@@ -91,7 +91,6 @@ if (-not $allEvents) {
         }
     }
 
-    # Type label mapping
     $typeMap = @{
         "ServiceIssue"        = "Service Issues"
         "PlannedMaintenance"  = "Planned Maintenance"
@@ -99,7 +98,6 @@ if (-not $allEvents) {
         "SecurityAdvisory"    = "Security Advisories"
     }
 
-    # Header
     $htmlBody = @"
     <h2 style='color:#0078D4; font-family:Segoe UI;'>Azure Service Health Summary</h2>
     <p style='font-family:Segoe UI; font-size:13px;'>
@@ -109,7 +107,6 @@ if (-not $allEvents) {
     </p>
 "@
 
-    # Summary tiles
     $htmlBody += "<div style='display:flex; gap:15px; flex-wrap:wrap; margin-bottom:20px;'>"
     foreach ($s in $summary) {
         $label = $typeMap[$s.Type]
@@ -121,15 +118,12 @@ if (-not $allEvents) {
             default               { "#666" }
         }
 
-        $htmlBody += "<div style='flex:1; min-width:150px; background:$color; color:white; 
-                        border-radius:10px; padding:12px; text-align:center;'>
-                        <div style='font-size:22px; font-weight:bold;'>$($s.Count)</div>
-                        <div style='font-size:13px;'>$label</div>
-                      </div>"
+        $htmlBody += "<div style='flex:1; min-width:150px; background:$color; color:white; border-radius:10px; padding:12px; text-align:center;'>"
+        $htmlBody += "<div style='font-size:22px; font-weight:bold;'>$($s.Count)</div>"
+        $htmlBody += "<div style='font-size:13px;'>$label</div></div>"
     }
     $htmlBody += "</div>"
 
-    # Detailed tables by type
     $grouped = $allEvents | Group-Object -Property IncidentType
     foreach ($group in $grouped) {
         $incidentType = $typeMap[$group.Name]
@@ -142,37 +136,18 @@ if (-not $allEvents) {
         }
 
         $htmlBody += "<h3 style='color:#333;font-family:Segoe UI;margin-top:25px;'>$incidentType</h3>"
-        $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>
-                        <thead>
-                            <tr style='background-color:$color; border-bottom:2px solid #ccc;'>
-                                <th style='padding:8px; text-align:left;'>Subscription</th>
-                                <th style='padding:8px; text-align:left;'>Title</th>
-                                <th style='padding:8px; text-align:left;'>Impact</th>
-                                <th style='padding:8px; text-align:left;'>Status</th>
-                                <th style='padding:8px; text-align:left;'>Start Time</th>
-                                <th style='padding:8px; text-align:left;'>Last Update</th>
-                                <th style='padding:8px; text-align:left;'>Region(s)</th>
-                            </tr>
-                        </thead>
-                        <tbody>"
+        $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>"
+        $htmlBody += "<thead><tr style='background-color:$color; border-bottom:2px solid #ccc;'>"
+        $htmlBody += "<th style='padding:8px; text-align:left;'>Subscription</th><th style='padding:8px; text-align:left;'>Title</th><th style='padding:8px; text-align:left;'>Impact</th><th style='padding:8px; text-align:left;'>Status</th><th style='padding:8px; text-align:left;'>Start Time</th><th style='padding:8px; text-align:left;'>Last Update</th><th style='padding:8px; text-align:left;'>Region(s)</th></tr></thead><tbody>"
+
         foreach ($e in $group.Group) {
             $statusColor = if ($e.Status -eq "Active") { "color:#E81123;font-weight:bold;" } else { "color:#107C10;" }
-
-            $htmlBody += "<tr style='border-bottom:1px solid #eee;'>
-                            <td style='padding:6px;'>$($e.SubscriptionName)</td>
-                            <td style='padding:6px;'>$($e.Title)</td>
-                            <td style='padding:6px;'>$($e.Impact)</td>
-                            <td style='padding:6px;$statusColor'>$($e.Status)</td>
-                            <td style='padding:6px;'>$($e.StartTime.ToString('dd-MMM-yyyy HH:mm'))</td>
-                            <td style='padding:6px;'>$($e.LastUpdateTime.ToString('dd-MMM-yyyy HH:mm'))</td>
-                            <td style='padding:6px;'>$($e.Regions)</td>
-                          </tr>"
+            $htmlBody += "<tr style='border-bottom:1px solid #eee;'><td style='padding:6px;'>$($e.SubscriptionName)</td><td style='padding:6px;'>$($e.Title)</td><td style='padding:6px;'>$($e.Impact)</td><td style='padding:6px;$statusColor'>$($e.Status)</td><td style='padding:6px;'>$($e.StartTime.ToString('dd-MMM-yyyy HH:mm'))</td><td style='padding:6px;'>$($e.LastUpdateTime.ToString('dd-MMM-yyyy HH:mm'))</td><td style='padding:6px;'>$($e.Regions)</td></tr>"
         }
         $htmlBody += "</tbody></table><br/>"
     }
 }
 
-# Final HTML layout
 $emailBody = @"
 <html>
 <head>
@@ -185,9 +160,7 @@ table tr:hover { background-color:#f5f5f5; }
 </head>
 <body>
 $htmlBody
-<p style='font-size:11px; color:#999; margin-top:20px;'>
-Generated automatically by Azure Automation Runbook • $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')
-</p>
+<p style='font-size:11px; color:#999; margin-top:20px;'>Generated automatically by Azure Automation Runbook • $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')</p>
 </body>
 </html>
 "@
@@ -197,11 +170,23 @@ $emailBody | Out-File -FilePath $OutputHtmlFile -Encoding UTF8
 Write-Host "✅ HTML report saved to: $OutputHtmlFile"
 
 # ----------------------------
-# OPTIONAL: SEND EMAIL
+# SEND EMAIL USING MICROSOFT GRAPH
 # ----------------------------
 try {
-    Send-MailMessage -To $To -From $From -Subject $Subject -BodyAsHtml -Body $emailBody -SmtpServer $SmtpServer -UseSsl
-    Write-Host "📧 Email sent successfully to $To"
+    $emailParams = @{
+        Message = @{
+            Subject = $Subject
+            Body    = @{
+                ContentType = "HTML"
+                Content     = $emailBody
+            }
+            ToRecipients = @(@{EmailAddress=@{Address=$To}})
+        }
+        SaveToSentItems = $true
+    }
+
+    Send-MgUserMail @emailParams
+    Write-Host "📧 Email sent successfully to $To via Microsoft Graph"
 } catch {
-    Write-Host "⚠️ Failed to send email: $($_.Exception.Message)"
+    Write-Host "⚠️ Failed to send email via Microsoft Graph: $($_.Exception.Message)"
 }
