@@ -1,101 +1,110 @@
 <#
 .SYNOPSIS
-  Comprehensive Azure Service Health & Security Report across all subscriptions
+  Azure Tenant-Wide Health, Maintenance & Security Report
 .DESCRIPTION
-  Fetches Active Alerts, Planned Maintenance, Health Advisories, and Security Advisories
-  from all accessible subscriptions and sends an HTML report via Microsoft Graph email.
+  Collects Azure Monitor Alerts, Planned Maintenance, Health Advisories, and Security Advisories
+  across all subscriptions, builds an HTML report, and emails it via Microsoft Graph.
 #>
 
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
-$OutputHtmlFile = "C:\Temp\AzureComprehensiveReport.html"
+$OutputHtmlFile = "C:\Temp\AzureTenantHealthSecurityReport.html"
 $To = "you@example.com"
-$Subject = "Azure Monitor & Service Health Report - $(Get-Date -Format 'dd-MMM-yyyy')"
+$Subject = "Azure Tenant Health & Security Report - $(Get-Date -Format 'dd-MMM-yyyy')"
 $ManagedIdentityClientId = "9464e54c-6ec0-4b15-8380-6172a2e3114b"
 
 # ----------------------------
-# CONNECT TO AZURE
+# CONNECT TO AZURE & MICROSOFT GRAPH
 # ----------------------------
-Write-Host "🔹 Connecting to Azure using Managed Identity..."
-Connect-AzAccount -Identity
-Write-Host "✅ Connected to Azure."
+Write-Host "🔹 Connecting to Azure and Microsoft Graph..."
+Connect-AzAccount -Identity -ErrorAction Stop
+Connect-MgGraph -Identity -ClientId $ManagedIdentityClientId -ErrorAction Stop
+Write-Host "✅ Connected to Azure and Graph."
 
 # ----------------------------
-# GET ALL SUBSCRIPTIONS
+# PREPARE VARIABLES
 # ----------------------------
-$subscriptions = Get-AzSubscription
-Write-Host "🔹 Found $($subscriptions.Count) subscriptions."
-
-# Initialize arrays to hold data
 $allAlerts = @()
 $allMaintenance = @()
 $allHealthAdvisories = @()
 $allSecurityAdvisories = @()
 
+# ----------------------------
+# FETCH DATA ACROSS SUBSCRIPTIONS
+# ----------------------------
+$subscriptions = Get-AzSubscription
 foreach ($sub in $subscriptions) {
-    Write-Host "🔹 Processing subscription: $($sub.Name) ($($sub.Id))..."
-    Set-AzContext -SubscriptionId $sub.Id
+    Write-Host "🔸 Processing subscription: $($sub.Name)"
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
     # ----------------------------
-    # ACTIVE ALERTS
+    # 1️⃣ Azure Monitor Alerts
     # ----------------------------
     try {
-        $alerts = Get-AzMetricAlertRuleV2 -DetailedOutput | Where-Object { $_.Enabled -eq $true }
-        foreach ($alert in $alerts) {
+        $alerts = Get-AzMetricAlertRuleV2 -ErrorAction SilentlyContinue
+        foreach ($a in $alerts) {
             $allAlerts += [PSCustomObject]@{
                 SubscriptionName = $sub.Name
-                AlertName        = $alert.Name
-                Severity         = $alert.Severity
-                State            = $alert.State
-                Resource         = $alert.Scopes -join ", "
-                LastUpdated      = $alert.LastUpdatedTime
+                AlertName        = $a.Name
+                Severity         = $a.Severity
+                State            = $a.Enabled
+                Resource         = $a.TargetResourceId.Split('/')[-1]
+                LastUpdated      = (Get-Date).ToLocalTime()
             }
         }
-    } catch { Write-Host "⚠️ Alerts fetch failed for $($sub.Name): $($_.Exception.Message)" }
+    } catch {
+        Write-Host "⚠️ Alerts fetch failed for $($sub.Name): $($_.Exception.Message)"
+    }
 
     # ----------------------------
-    # PLANNED MAINTENANCE
+    # 2️⃣ Planned Maintenance
     # ----------------------------
     try {
-        $maintenance = Get-AzActivityLog -StartTime (Get-Date).AddDays(-7) `
-                                         -EndTime (Get-Date) `
-                                         -MaxRecord 500 `
-                                         -Status Active | Where-Object { $_.EventName.Value -like "*Planned Maintenance*" }
-        foreach ($m in $maintenance) {
+        $maintenanceUpdates = Get-AzMaintenanceUpdate -ErrorAction SilentlyContinue
+        foreach ($m in $maintenanceUpdates) {
             $allMaintenance += [PSCustomObject]@{
                 SubscriptionName = $sub.Name
                 ResourceGroup    = $m.ResourceGroupName
-                ResourceName     = $m.ResourceId.Split('/')[-1]
-                Event            = $m.EventName.Value
-                ScheduledTime    = $m.EventTimestamp.ToLocalTime()
+                ResourceName     = $m.ResourceName
+                Event            = $m.Status
+                ScheduledTime    = $m.StatusDateTime.ToLocalTime()
             }
         }
-    } catch { Write-Host "⚠️ Planned Maintenance fetch failed for $($sub.Name): $($_.Exception.Message)" }
+    } catch {
+        Write-Host "⚠️ Planned Maintenance fetch failed for $($sub.Name): $($_.Exception.Message)"
+    }
 
     # ----------------------------
-    # HEALTH ADVISORIES
+    # 3️⃣ Health Advisories
     # ----------------------------
     try {
-        $health = Get-AzResourceHealthAvailabilityStatus -DetailedStatus
-        foreach ($h in $health | Where-Object { $_.AvailabilityState -ne "Available" }) {
-            $allHealthAdvisories += [PSCustomObject]@{
-                SubscriptionName = $sub.Name
-                ResourceGroup    = $h.ResourceGroupName
-                ResourceName     = $h.ResourceName
-                Type             = $h.ResourceType
-                Status           = $h.AvailabilityState
-                Details          = $h.ReasonType
-                LastUpdated      = $h.Timestamp.ToLocalTime()
-            }
+        $resources = Get-AzResource
+        foreach ($r in $resources) {
+            try {
+                $health = Get-AzResourceHealth -ResourceId $r.ResourceId -ErrorAction Stop
+                if ($health.AvailabilityState -ne "Available") {
+                    $allHealthAdvisories += [PSCustomObject]@{
+                        SubscriptionName = $sub.Name
+                        ResourceGroup    = $r.ResourceGroupName
+                        ResourceName     = $r.Name
+                        Type             = $r.ResourceType
+                        Status           = $health.AvailabilityState
+                        Details          = $health.ReasonType
+                        LastUpdated      = $health.Timestamp.ToLocalTime()
+                    }
+                }
+            } catch {}
         }
-    } catch { Write-Host "⚠️ Health Advisories fetch failed for $($sub.Name): $($_.Exception.Message)" }
+    } catch {
+        Write-Host "⚠️ Health Advisories fetch failed for $($sub.Name): $($_.Exception.Message)"
+    }
 
     # ----------------------------
-    # SECURITY ADVISORIES
+    # 4️⃣ Security Advisories
     # ----------------------------
     try {
-        $securityAlerts = Get-AzSecurityAlert
+        $securityAlerts = Get-AzSecurityAlert -ErrorAction SilentlyContinue
         foreach ($sa in $securityAlerts) {
             $allSecurityAdvisories += [PSCustomObject]@{
                 SubscriptionName = $sub.Name
@@ -107,97 +116,42 @@ foreach ($sub in $subscriptions) {
                 TimeGenerated    = $sa.TimeGenerated.ToLocalTime()
             }
         }
-    } catch { Write-Host "⚠️ Security Advisories fetch failed for $($sub.Name): $($_.Exception.Message)" }
+    } catch {
+        Write-Host "⚠️ Security Advisories fetch failed for $($sub.Name): $($_.Exception.Message)"
+    }
 }
 
 # ----------------------------
 # BUILD HTML REPORT
 # ----------------------------
-$htmlBody = "<h2 style='color:#0078D4; font-family:Segoe UI;'>Azure Monitor & Service Health Report</h2>"
-$htmlBody += "<p style='font-family:Segoe UI; font-size:13px;'>Generated: $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')</p>"
-
-# ----- Active Alerts -----
-if ($allAlerts.Count -eq 0) { $htmlBody += "<h3 style='color:#107C10;'>✅ No Active Alerts</h3>" }
-else {
-    $htmlBody += "<h3 style='color:#E81123;'>📢 Active Alerts ($($allAlerts.Count))</h3>"
-    $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>"
-    $htmlBody += "<thead><tr style='background-color:#E7F3FD; border-bottom:2px solid #ccc;'>
-                    <th>Subscription</th><th>Alert Name</th><th>Severity</th><th>State</th><th>Resource</th><th>Last Updated</th></tr></thead><tbody>"
-    foreach ($a in $allAlerts) {
-        $htmlBody += "<tr style='border-bottom:1px solid #eee;'>
-                        <td>$($a.SubscriptionName)</td>
-                        <td>$($a.AlertName)</td>
-                        <td>$($a.Severity)</td>
-                        <td>$($a.State)</td>
-                        <td>$($a.Resource)</td>
-                        <td>$($a.LastUpdated.ToString('dd-MMM-yyyy HH:mm'))</td>
-                      </tr>"
+function New-SectionHtml ($title, $icon, $color, $data) {
+    if (-not $data -or $data.Count -eq 0) {
+        return "<h3 style='color:$color;'>$icon $title</h3><p style='font-size:13px;color:gray;'>✅ None detected</p>"
     }
-    $htmlBody += "</tbody></table><br/>"
+
+    $table = "<h3 style='color:$color;'>$icon $title</h3><table style='width:100%;border-collapse:collapse;font-family:Segoe UI;font-size:13px;'>"
+    $table += "<thead><tr style='background-color:#f3f3f3;border-bottom:2px solid #ccc;'>"
+    $data[0].psobject.Properties.Name | ForEach-Object {
+        $table += "<th style='padding:6px;text-align:left;'>$_</th>"
+    }
+    $table += "</tr></thead><tbody>"
+    foreach ($row in $data) {
+        $table += "<tr style='border-bottom:1px solid #eee;'>"
+        foreach ($val in $row.psobject.Properties.Value) {
+            $table += "<td style='padding:6px;'>$val</td>"
+        }
+        $table += "</tr>"
+    }
+    $table += "</tbody></table><br/>"
+    return $table
 }
 
-# ----- Planned Maintenance -----
-if ($allMaintenance.Count -eq 0) { $htmlBody += "<h3 style='color:#107C10;'>✅ No Planned Maintenance</h3>" }
-else {
-    $htmlBody += "<h3 style='color:#FF8C00;'>🛠 Planned Maintenance ($($allMaintenance.Count))</h3>"
-    $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>"
-    $htmlBody += "<thead><tr style='background-color:#FFF4E5; border-bottom:2px solid #ccc;'>
-                    <th>Subscription</th><th>Resource Group</th><th>Resource</th><th>Event</th><th>Scheduled Time</th></tr></thead><tbody>"
-    foreach ($m in $allMaintenance) {
-        $htmlBody += "<tr style='border-bottom:1px solid #eee;'>
-                        <td>$($m.SubscriptionName)</td>
-                        <td>$($m.ResourceGroup)</td>
-                        <td>$($m.ResourceName)</td>
-                        <td>$($m.Event)</td>
-                        <td>$($m.ScheduledTime.ToString('dd-MMM-yyyy HH:mm'))</td>
-                      </tr>"
-    }
-    $htmlBody += "</tbody></table><br/>"
-}
+$htmlBody = @()
+$htmlBody += New-SectionHtml "Active Alerts" "📢" "#E81123" $allAlerts
+$htmlBody += New-SectionHtml "Planned Maintenance" "🛠" "#F7630C" $allMaintenance
+$htmlBody += New-SectionHtml "Health Advisories" "⚠" "#FFB900" $allHealthAdvisories
+$htmlBody += New-SectionHtml "Security Advisories" "🔒" "#6B4EFF" $allSecurityAdvisories
 
-# ----- Health Advisories -----
-if ($allHealthAdvisories.Count -eq 0) { $htmlBody += "<h3 style='color:#107C10;'>✅ No Health Advisories</h3>" }
-else {
-    $htmlBody += "<h3 style='color:#FFD700;'>⚠ Health Advisories ($($allHealthAdvisories.Count))</h3>"
-    $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>"
-    $htmlBody += "<thead><tr style='background-color:#FFFBE6; border-bottom:2px solid #ccc;'>
-                    <th>Subscription</th><th>Resource Group</th><th>Resource</th><th>Type</th><th>Status</th><th>Details</th><th>Last Updated</th></tr></thead><tbody>"
-    foreach ($h in $allHealthAdvisories) {
-        $htmlBody += "<tr style='border-bottom:1px solid #eee;'>
-                        <td>$($h.SubscriptionName)</td>
-                        <td>$($h.ResourceGroup)</td>
-                        <td>$($h.ResourceName)</td>
-                        <td>$($h.Type)</td>
-                        <td>$($h.Status)</td>
-                        <td>$($h.Details)</td>
-                        <td>$($h.LastUpdated.ToString('dd-MMM-yyyy HH:mm'))</td>
-                      </tr>"
-    }
-    $htmlBody += "</tbody></table><br/>"
-}
-
-# ----- Security Advisories -----
-if ($allSecurityAdvisories.Count -eq 0) { $htmlBody += "<h3 style='color:#107C10;'>✅ No Security Advisories</h3>" }
-else {
-    $htmlBody += "<h3 style='color:#800080;'>🔒 Security Advisories ($($allSecurityAdvisories.Count))</h3>"
-    $htmlBody += "<table style='width:100%; border-collapse:collapse; font-family:Segoe UI; font-size:13px;'>"
-    $htmlBody += "<thead><tr style='background-color:#F3E5FF; border-bottom:2px solid #ccc;'>
-                    <th>Subscription</th><th>Resource Group</th><th>Resource</th><th>Alert Type</th><th>Severity</th><th>Status</th><th>Time</th></tr></thead><tbody>"
-    foreach ($s in $allSecurityAdvisories) {
-        $htmlBody += "<tr style='border-bottom:1px solid #eee;'>
-                        <td>$($s.SubscriptionName)</td>
-                        <td>$($s.ResourceGroup)</td>
-                        <td>$($s.ResourceName)</td>
-                        <td>$($s.AlertType)</td>
-                        <td>$($s.Severity)</td>
-                        <td>$($s.Status)</td>
-                        <td>$($s.TimeGenerated.ToString('dd-MMM-yyyy HH:mm'))</td>
-                      </tr>"
-    }
-    $htmlBody += "</tbody></table><br/>"
-}
-
-# Final HTML layout
 $emailBody = @"
 <html>
 <head>
@@ -205,26 +159,24 @@ $emailBody = @"
 body { font-family:'Segoe UI', Arial, sans-serif; margin: 20px; color:#222; }
 a { color:#0078D4; text-decoration:none; }
 a:hover { text-decoration:underline; }
-table tr:hover { background-color:#f5f5f5; }
-th, td { padding:6px; text-align:left; }
+table tr:hover { background-color:#f9f9f9; }
 </style>
 </head>
 <body>
+<h2 style='color:#0078D4;'>Azure Tenant Health & Security Report</h2>
+<p style='font-size:13px;'>Generated: $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')</p>
 $htmlBody
-<p style='font-size:11px; color:#999; margin-top:20px;'>Generated automatically by Azure Automation Runbook • $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')</p>
+<p style='font-size:11px;color:#888;'>Generated automatically by Azure Automation • $(Get-Date -Format 'dd-MMM-yyyy HH:mm:ss')</p>
 </body>
 </html>
 "@
 
-# Save HTML report locally
 $emailBody | Out-File -FilePath $OutputHtmlFile -Encoding UTF8
 Write-Host "✅ HTML report saved to: $OutputHtmlFile"
 
 # ----------------------------
-# SEND EMAIL USING MICROSOFT GRAPH
+# SEND EMAIL VIA GRAPH
 # ----------------------------
-Write-Host "🔹 Connecting to Microsoft Graph..."
-Connect-MgGraph -Identity -ClientId $ManagedIdentityClientId
 try {
     $emailParams = @{
         Message = @{
@@ -238,7 +190,7 @@ try {
         SaveToSentItems = $true
     }
     Send-MgUserMail @emailParams
-    Write-Host "📧 Email sent successfully to $To"
+    Write-Host "📧 Email sent successfully to $To via Microsoft Graph"
 } catch {
     Write-Host "⚠️ Failed to send email via Microsoft Graph: $($_.Exception.Message)"
 }
