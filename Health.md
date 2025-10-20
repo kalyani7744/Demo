@@ -1,18 +1,87 @@
+<#
+.SYNOPSIS
+  Azure Service Health Report (Management Group Level)
+.DESCRIPTION
+  Retrieves Azure Service Health issues, advisories, and maintenance events
+  across all subscriptions under a management group and emails an HTML report.
+#>
+
 # ----------------------------
-# Build the Enhanced HTML Report
+# CONFIGURATION
+# ----------------------------
+$ManagementGroupId = "YourMgmtGroupIdHere"
+$OutputHtmlFile = "C:\Temp\ServiceHealthReport.html"
+
+# Email details (optional - if you want to send mail)
+$To = "you@example.com"
+$From = "azurehealth@example.com"
+$SmtpServer = "smtp.office365.com"
+$Subject = "Azure Service Health Report - $(Get-Date -Format 'dd-MMM-yyyy')"
+
+# ----------------------------
+# CONNECT TO AZURE
+# ----------------------------
+Write-Host "🔹 Connecting to Azure..."
+Connect-AzAccount -WarningAction SilentlyContinue | Out-Null
+Write-Host "✅ Connected to Azure."
+
+# ----------------------------
+# GET SUBSCRIPTIONS UNDER MGMT GROUP
+# ----------------------------
+Write-Host "🔹 Getting subscriptions under management group: $ManagementGroupId"
+$subs = Get-AzManagementGroupSubscription -GroupId $ManagementGroupId -ErrorAction Stop
+if (-not $subs) {
+    Write-Host "⚠️ No subscriptions found under management group $ManagementGroupId."
+    exit
+}
+
+# ----------------------------
+# COLLECT SERVICE HEALTH EVENTS
+# ----------------------------
+$allEvents = @()
+
+foreach ($sub in $subs) {
+    $subId = $sub.Id -replace ".*/"
+    Set-AzContext -SubscriptionId $subId -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "🔸 Checking subscription: $subId"
+
+    try {
+        $events = Get-AzServiceHealthEvent -Status Active, Resolved -ErrorAction Stop
+        foreach ($event in $events) {
+            $regions = if ($event.AffectedRegion.Name) { ($event.AffectedRegion.Name -join ', ') } else { 'Global' }
+            $impact = if ($event.ImpactType) { $event.ImpactType } else { 'N/A' }
+
+            $allEvents += [PSCustomObject]@{
+                SubscriptionId   = $subId
+                SubscriptionName = (Get-AzSubscription -SubscriptionId $subId).Name
+                Title            = $event.Title
+                Impact           = $impact
+                Status           = $event.Status
+                IncidentType     = $event.IncidentType
+                StartTime        = $event.StartTime
+                LastUpdateTime   = $event.LastUpdateTime
+                Regions          = $regions
+            }
+        }
+    } catch {
+        Write-Host "⚠️ Skipping subscription $subId due to permission or access issues."
+    }
+}
+
+# ----------------------------
+# BUILD ENHANCED HTML REPORT
 # ----------------------------
 if (-not $allEvents) {
-    Write-Host "✅ No events found across this management group."
+    Write-Host "✅ No events found."
     $htmlBody = @"
     <div style='text-align:center; font-family:Segoe UI;'>
-        <h2 style='color:#0078D4;'>✅ All Systems Healthy</h2>
-        <p style='font-size:14px;'>No active or recent Azure Service Health events across management group 
+        <h2 style='color:#107C10;'>✅ All Systems Healthy</h2>
+        <p style='font-size:14px;'>No active or recent Azure Service Health events found under management group 
         <b>$ManagementGroupId</b>.</p>
     </div>
 "@
-}
-else {
-    Write-Host "Building enhanced HTML report for $($allEvents.Count) event(s)..."
+} else {
+    Write-Host "📊 Building enhanced HTML report for $($allEvents.Count) event(s)..."
 
     # Create summary counts
     $summary = $allEvents | Group-Object -Property IncidentType | ForEach-Object {
@@ -22,7 +91,7 @@ else {
         }
     }
 
-    # Map type names
+    # Type label mapping
     $typeMap = @{
         "ServiceIssue"        = "Service Issues"
         "PlannedMaintenance"  = "Planned Maintenance"
@@ -30,7 +99,7 @@ else {
         "SecurityAdvisory"    = "Security Advisories"
     }
 
-    # HTML header
+    # Header
     $htmlBody = @"
     <h2 style='color:#0078D4; font-family:Segoe UI;'>Azure Service Health Summary</h2>
     <p style='font-family:Segoe UI; font-size:13px;'>
@@ -45,10 +114,10 @@ else {
     foreach ($s in $summary) {
         $label = $typeMap[$s.Type]
         $color = switch ($s.Type) {
-            "ServiceIssue"        { "#E81123" }   # Red
-            "PlannedMaintenance"  { "#0078D4" }   # Blue
-            "HealthAdvisory"      { "#107C10" }   # Green
-            "SecurityAdvisory"    { "#FFB900" }   # Orange
+            "ServiceIssue"        { "#E81123" }
+            "PlannedMaintenance"  { "#0078D4" }
+            "HealthAdvisory"      { "#107C10" }
+            "SecurityAdvisory"    { "#FFB900" }
             default               { "#666" }
         }
 
@@ -60,9 +129,8 @@ else {
     }
     $htmlBody += "</div>"
 
-    # Detailed tables grouped by incident type
+    # Detailed tables by type
     $grouped = $allEvents | Group-Object -Property IncidentType
-
     foreach ($group in $grouped) {
         $incidentType = $typeMap[$group.Name]
         $color = switch ($group.Name) {
@@ -104,9 +172,7 @@ else {
     }
 }
 
-# ----------------------------
-# Wrap the final HTML email layout
-# ----------------------------
+# Final HTML layout
 $emailBody = @"
 <html>
 <head>
@@ -126,6 +192,16 @@ Generated automatically by Azure Automation Runbook • $(Get-Date -Format 'dd-M
 </html>
 "@
 
-# Optional: Save locally
+# Save report locally
 $emailBody | Out-File -FilePath $OutputHtmlFile -Encoding UTF8
-Write-Host "✅ Enhanced HTML report saved to: $OutputHtmlFile"
+Write-Host "✅ HTML report saved to: $OutputHtmlFile"
+
+# ----------------------------
+# OPTIONAL: SEND EMAIL
+# ----------------------------
+try {
+    Send-MailMessage -To $To -From $From -Subject $Subject -BodyAsHtml -Body $emailBody -SmtpServer $SmtpServer -UseSsl
+    Write-Host "📧 Email sent successfully to $To"
+} catch {
+    Write-Host "⚠️ Failed to send email: $($_.Exception.Message)"
+}
