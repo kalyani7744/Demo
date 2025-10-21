@@ -9,7 +9,7 @@
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
-$OutputHtmlFile = "C:\Temp\AzureTenantHealthSecurityReport.html"
+$OutputHtmlFile = "C:\vm\vhd\AzureTenantHealthSecurityReport.html"
 $To = "you@example.com"
 $Subject = "Azure Tenant Health & Security Report - $(Get-Date -Format 'dd-MMM-yyyy')"
 $ManagedIdentityClientId = "9464e54c-6ec0-4b15-8380-6172a2e3114b"
@@ -19,7 +19,7 @@ $ManagedIdentityClientId = "9464e54c-6ec0-4b15-8380-6172a2e3114b"
 # ----------------------------
 Write-Host "🔹 Connecting to Azure and Microsoft Graph..."
 Connect-AzAccount -Identity -ErrorAction Stop
-Connect-MgGraph -Identity -ClientId $ManagedIdentityClientId -ErrorAction Stop
+Connect-MgGraph -Identity -ClientId "9464e54c-6ec0-4b15-8380-6172a2e3114b" -ErrorAction SilentlyContinue
 Write-Host "✅ Connected to Azure and Graph."
 
 # ----------------------------
@@ -61,7 +61,14 @@ foreach ($sub in $subscriptions) {
     # 2️⃣ Planned Maintenance
     # ----------------------------
     try {
-        $maintenanceUpdates = Get-AzMaintenanceUpdate -ErrorAction SilentlyContinue
+        $resources = Get-AzResource
+        foreach ($r in $resources) {
+        try {
+        $idParts = $r.ResourceId -split "/"
+        $providerName = $idParts[6]
+        $resourceType = $idParts[7]
+
+        $maintenanceUpdates = Get-AzMaintenanceUpdate  -ResourceGroupName $r.ResourceGroupName -providerName $providerName -ResourceType $resourceType -ResourceName $r.Name -ErrorAction SilentlyContinue
         foreach ($m in $maintenanceUpdates) {
             $allMaintenance += [PSCustomObject]@{
                 SubscriptionName = $sub.Name
@@ -72,6 +79,9 @@ foreach ($sub in $subscriptions) {
             }
         }
     } catch {
+    #skip resources
+    }}}
+    catch{
         Write-Host "⚠️ Planned Maintenance fetch failed for $($sub.Name): $($_.Exception.Message)"
     }
 
